@@ -248,6 +248,7 @@ async fn run_with_config(
             Device::Wingtech => display::wingtech::update_ui,
             Device::Pinephone => display::headless::update_ui,
             Device::Uz801 => display::uz801::update_ui,
+            Device::M6 => display::m6::update_ui,
         };
         update_ui(&task_tracker, &config, shutdown_token.clone(), ui_update_rx);
 

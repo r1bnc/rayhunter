@@ -25,6 +25,7 @@ Rayhunter is confirmed to work on these devices.
 | [TP-Link M7310](./tplink-m7310.md) | Africa, Europe, Middle East |
 | [PinePhone and PinePhone Pro](./pinephone.md) | Global |
 | [FY UZ801](./uz801.md) | Asia, Europe |
+| [M6](./m6.md) | Asia, Europe |
 | [Moxee hotspot](./moxee.md) | Americas |
 
 ## Adding new devices

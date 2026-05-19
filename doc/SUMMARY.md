@@ -20,6 +20,7 @@
   - [TP-Link M7310](./tplink-m7310.md)
   - [Tmobile TMOHS1](./tmobile-tmohs1.md)
   - [UZ801](./uz801.md)
+  - [M6](./m6.md)
   - [Wingtech CT2MHS01](./wingtech-ct2mhs01.md)
   - [PinePhone and PinePhone Pro](./pinephone.md)
   - [Moxee Hotspot](./moxee.md)

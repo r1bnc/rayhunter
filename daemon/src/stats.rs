@@ -132,9 +132,9 @@ async fn get_cmd_output(mut cmd: Command) -> Result<String, String> {
 impl MemoryStats {
     // runs "free -k" and parses the output to retrieve memory stats for most devices,
     pub async fn new(device: &Device) -> Result<Self, String> {
-        // Use busybox for Uz801
+        // Use busybox for Uz801 & M6
         let mut free_cmd: Command;
-        if matches!(device, Device::Uz801) {
+        if matches!(device, Device::Uz801 | Device::M6) {
             free_cmd = Command::new("busybox");
             free_cmd.arg("free");
         } else {

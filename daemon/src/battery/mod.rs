@@ -15,6 +15,7 @@ pub mod orbic;
 pub mod tmobile;
 pub mod tplink;
 pub mod wingtech;
+pub mod m6;
 
 const LOW_BATTERY_LEVEL: u8 = 10;
 
@@ -56,6 +57,7 @@ pub async fn get_battery_status(device: &Device) -> Result<BatteryState, Rayhunt
         Device::Wingtech => wingtech::get_battery_state().await?,
         Device::Tmobile => tmobile::get_battery_state().await?,
         Device::Tplink => tplink::get_battery_state().await?,
+        Device::M6 => m6::get_battery_state().await?,
         _ => return Err(RayhunterError::FunctionNotSupportedForDeviceError),
     })
 }

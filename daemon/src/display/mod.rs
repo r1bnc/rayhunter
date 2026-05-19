@@ -11,6 +11,7 @@ pub mod tplink_framebuffer;
 pub mod tplink_onebit;
 pub mod uz801;
 pub mod wingtech;
+pub mod m6;
 
 /// A list of available display states
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]

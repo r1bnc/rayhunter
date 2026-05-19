@@ -24,6 +24,7 @@ mod util;
 #[cfg(not(target_os = "android"))]
 mod uz801;
 mod wingtech;
+mod m6;
 
 use crate::output::eprintln;
 
@@ -61,6 +62,9 @@ enum Command {
     Tplink(InstallTpLink),
     /// Install rayhunter on the Wingtech CT2MHS01.
     Wingtech(WingtechArgs),
+    /// Install rayhunter on the M6.
+    #[cfg(not(target_os = "android"))]
+    M6(M6Args),
     /// Developer utilities.
     Util(Util),
 }
@@ -206,6 +210,9 @@ enum UtilSubCommand {
     /// Before running this utility, you need to make telnet accessible with `installer util
     /// wingtech-start-telnet`.
     WingtechSendFile(WingtechSendFile),
+    /// Root the M6 via ADB.
+    #[cfg(not(target_os = "android"))]
+    M6StartAdb(M6Args),
 }
 
 #[derive(Parser, Debug)]
@@ -264,6 +271,13 @@ struct WingtechArgs {
     /// Web portal admin password.
     #[arg(long)]
     admin_password: String,
+}
+
+#[derive(Parser, Debug)]
+struct M6Args {
+    /// IP address for M6 admin interface, if custom.
+    #[arg(long, default_value = "192.168.100.1")]
+    admin_ip: String,
 }
 
 #[derive(Parser, Debug)]

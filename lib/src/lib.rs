@@ -41,4 +41,5 @@ pub enum Device {
     Pinephone,
     Uz801,
     Moxee,
+    M6,
 }
