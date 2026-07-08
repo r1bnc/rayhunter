@@ -31,7 +31,7 @@ use crate::analysis::{AnalysisCtrlMessage, AnalysisWriter};
 use crate::config::GpsMode;
 use crate::display;
 use crate::notifications::{Notification, NotificationType};
-use crate::qmdl_store::{RecordingStore, RecordingStoreError};
+use crate::qmdl_store::{FileKind, RecordingStore, RecordingStoreError};
 use crate::server::ServerState;
 use crate::stats::DiskStats;
 
@@ -74,7 +74,7 @@ pub struct DiagTask {
 
 enum DiagState {
     Recording {
-        qmdl_writer: QmdlWriter<File>,
+        qmdl_writer: Box<QmdlWriter<File>>,
         analysis_writer: Box<AnalysisWriter>,
     },
     Stopped,
@@ -158,7 +158,7 @@ impl DiagTask {
             DiskSpaceCheck::Failed => {}
         }
 
-        let (qmdl_file, analysis_file) = qmdl_store.new_entry(self.gps_mode).await?;
+        let (qmdl_gz_file, analysis_file) = qmdl_store.new_entry(self.gps_mode).await?;
 
         // For fixed-mode sessions, write the configured coordinates to the storage
         // immediately so the per-session GPS is stored durably and isn't affected
@@ -185,13 +185,11 @@ impl DiagTask {
                 .await
                 .map_err(RecordingStoreError::WriteFileError)?;
         }
-
-        self.stop_current_recording().await;
-        let qmdl_writer = QmdlWriter::new(qmdl_file);
+        self.stop_current_recording(qmdl_store).await;
+        let qmdl_writer = Box::new(QmdlWriter::new(qmdl_gz_file));
         let analysis_writer = AnalysisWriter::new(analysis_file, &self.analyzer_config)
             .await
             .map_err(RecordingStoreError::WriteFileError)?;
-
         self.state = DiagState::Recording {
             qmdl_writer,
             analysis_writer: Box::new(analysis_writer),
@@ -209,7 +207,7 @@ impl DiagTask {
 
     /// Stop recording, optionally annotating the entry with a reason.
     async fn stop(&mut self, qmdl_store: &mut RecordingStore, reason: Option<String>) {
-        self.stop_current_recording().await;
+        self.stop_current_recording(qmdl_store).await;
         if let Some(reason) = reason
             && let Err(e) = qmdl_store.set_current_stop_reason(reason).await
         {
@@ -296,17 +294,31 @@ impl DiagTask {
         }
     }
 
-    async fn stop_current_recording(&mut self) {
+    async fn stop_current_recording(&mut self, qmdl_store: &mut RecordingStore) {
         let mut state = DiagState::Stopped;
         std::mem::swap(&mut self.state, &mut state);
         if let DiagState::Recording {
-            analysis_writer, ..
+            qmdl_writer,
+            analysis_writer,
+            ..
         } = state
         {
-            analysis_writer
-                .close()
-                .await
-                .expect("failed to close analysis writer");
+            match (qmdl_writer.close().await, analysis_writer.close().await) {
+                (Ok(size), Ok(())) => {
+                    if let Err(err) = qmdl_store.update_current_entry_qmdl_size(size).await {
+                        error!("failed to update QMDL entry size while closing it: {err:?}");
+                    }
+                }
+                (qmdl_result, analysis_result) => {
+                    if let Err(err) = qmdl_result {
+                        error!("failed to close QmdlWriter: {err:?}");
+                    }
+                    if let Err(err) = analysis_result {
+                        error!("failed to close AnalysisWriter: {err:?}");
+                    }
+                    panic!();
+                }
+            }
         }
     }
 
@@ -374,23 +386,19 @@ impl DiagTask {
                 self.stop(qmdl_store, Some(reason)).await;
                 return;
             }
-            debug!(
-                "total QMDL bytes written: {}, updating manifest...",
-                qmdl_writer.total_written
-            );
-            let index = qmdl_store
-                .current_entry
-                .expect("DiagDevice had qmdl_writer, but QmdlStore didn't have current entry???");
-            if let Err(e) = qmdl_store
-                .update_entry_qmdl_size(index, qmdl_writer.total_written)
-                .await
-            {
-                let reason = format!("failed to update manifest (disk full?): {e}");
-                error!("{reason}");
-                self.stop(qmdl_store, Some(reason)).await;
-                return;
+            if let Ok(file_size) = qmdl_writer.size().await {
+                debug!(
+                    "total QMDL bytes written: {}, updating manifest...",
+                    file_size
+                );
+                if let Err(e) = qmdl_store.update_current_entry_qmdl_size(file_size).await {
+                    let reason = format!("failed to update manifest (disk full?): {e}");
+                    error!("{reason}");
+                    self.stop(qmdl_store, Some(reason)).await;
+                    return;
+                }
+                debug!("done!");
             }
-            debug!("done!");
 
             // Extract the latest packet timestamp from this container
             if let Some(ts) = container
@@ -407,7 +415,7 @@ impl DiagTask {
 
             let container_bytes: usize = container.messages.iter().map(|m| m.data.len()).sum();
             self.bytes_since_space_check += container_bytes;
-            let max_type = match analysis_writer.analyze(container).await {
+            let max_type = match analysis_writer.analyze_container(container).await {
                 Ok(t) => t,
                 Err(e) => {
                     warn!("failed to analyze container: {e}");
@@ -501,7 +509,8 @@ pub fn run_diag_read_thread(
                         // time to go
                         Some(DiagDeviceCtrlMessage::Exit) | None => {
                             info!("Diag reader thread exiting...");
-                            diag_task.stop_current_recording().await;
+                            let mut qmdl_store = qmdl_store_lock.write().await;
+                            diag_task.stop_current_recording(qmdl_store.deref_mut()).await;
                             return Ok(())
                         },
                         Some(DiagDeviceCtrlMessage::DeleteEntry { name, response_tx }) => {
@@ -747,9 +756,10 @@ pub async fn get_analysis_report(
         ))?
     };
     let analysis_file = qmdl_store
-        .open_entry_analysis(entry_index)
+        .open_file(entry_index, FileKind::Analysis)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?
+        .ok_or((StatusCode::NOT_FOUND, "Analysis file not found".to_string()))?;
 
     // Read and normalize the NDJSON file
     let reader = BufReader::new(analysis_file);

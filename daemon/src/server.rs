@@ -6,17 +6,22 @@ use axum::Json;
 use axum::body::Body;
 use axum::extract::Path;
 use axum::extract::State;
-use axum::http::header::{self, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{self, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Local};
+use futures::TryStreamExt;
 use log::{error, warn};
+use rayhunter::qmdl::QmdlMessageReader;
 use serde::{Deserialize, Serialize};
+use std::pin::pin;
 use std::sync::Arc;
 use tokio::fs::write;
-use tokio::io::{AsyncReadExt, copy, duplex};
+use tokio::io::copy;
+use tokio::io::duplex;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::Sender;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
@@ -28,7 +33,8 @@ use crate::display::DisplayState;
 use crate::gps::GpsData;
 use crate::notifications::DEFAULT_NOTIFICATION_TIMEOUT;
 use crate::pcap::{generate_pcap_data, load_gps_records_for_entry};
-use crate::qmdl_store::RecordingStore;
+use crate::qmdl_store::{FileKind, RecordingStore};
+use crate::update::UpdateStatus;
 
 pub struct ServerState {
     pub config_path: String,
@@ -42,6 +48,7 @@ pub struct ServerState {
     pub wifi_status: Arc<RwLock<wifi_station::WifiStatus>>,
     pub wifi_scan_lock: tokio::sync::Mutex<()>,
     pub gps_state: Arc<RwLock<Option<GpsData>>>,
+    pub update_status_lock: Arc<RwLock<UpdateStatus>>,
 }
 
 #[cfg_attr(feature = "apidocs", utoipa::path(
@@ -65,27 +72,29 @@ pub async fn get_qmdl(
 ) -> Result<Response, (StatusCode, String)> {
     let qmdl_idx = qmdl_name.trim_end_matches(".qmdl");
     let qmdl_store = state.qmdl_store_lock.read().await;
-    let (entry_index, entry) = qmdl_store.entry_for_name(qmdl_idx).ok_or((
+    let (entry_index, _) = qmdl_store.entry_for_name(qmdl_idx).ok_or((
         StatusCode::NOT_FOUND,
         format!("couldn't find qmdl file with name {qmdl_idx}"),
     ))?;
     let qmdl_file = qmdl_store
-        .open_entry_qmdl(entry_index)
+        .open_file(entry_index, FileKind::Qmdl)
         .await
         .map_err(|err| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("error opening QMDL file: {err}"),
             )
-        })?;
-    let limited_qmdl_file = qmdl_file.take(entry.qmdl_size_bytes as u64);
-    let qmdl_stream = ReaderStream::new(limited_qmdl_file);
+        })?
+        .ok_or((StatusCode::NOT_FOUND, "QMDL file not found".to_string()))?;
+    let qmdl_reader = QmdlMessageReader::new(qmdl_file).await.map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("error reading QMDL file: {err}"),
+        )
+    })?;
 
-    let headers = [
-        (CONTENT_TYPE, "application/octet-stream"),
-        (CONTENT_LENGTH, &entry.qmdl_size_bytes.to_string()),
-    ];
-    let body = Body::from_stream(qmdl_stream);
+    let headers = [(CONTENT_TYPE, "application/octet-stream")];
+    let body = Body::from_stream(qmdl_reader.into_qmdl_stream());
     Ok((headers, body).into_response())
 }
 
@@ -331,7 +340,7 @@ pub async fn get_zip(
     Path(entry_name): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
     let qmdl_idx = entry_name.trim_end_matches(".zip").to_owned();
-    let (entry_index, qmdl_size_bytes) = {
+    let entry_index = {
         let qmdl_store = state.qmdl_store_lock.read().await;
         let (entry_index, entry) = qmdl_store.entry_for_name(&qmdl_idx).ok_or((
             StatusCode::NOT_FOUND,
@@ -345,7 +354,7 @@ pub async fn get_zip(
             ));
         }
 
-        (entry_index, entry.qmdl_size_bytes)
+        entry_index
     };
 
     let qmdl_store_lock = state.qmdl_store_lock.clone();
@@ -357,24 +366,51 @@ pub async fn get_zip(
         let result: Result<(), Error> = async {
             let mut zip = ZipFileWriter::with_tokio(writer);
 
-            // Add QMDL file
-            {
-                let entry =
-                    ZipEntryBuilder::new(format!("{qmdl_idx}.qmdl").into(), Compression::Stored);
+            const EXCLUDED_FROM_ZIP: &[FileKind] = &[FileKind::Analysis];
+
+            // Add stored files
+            for &file_kind in FileKind::ALL {
+                if EXCLUDED_FROM_ZIP.contains(&file_kind) {
+                    continue;
+                }
+
+                let file_opt = {
+                    let qmdl_store = qmdl_store_lock.read().await;
+                    qmdl_store.open_file(entry_index, file_kind).await?
+                };
+
+                let Some(mut file) = file_opt else {
+                    continue;
+                };
+
+                /*
+                 * `qmdl_compressed` is always false here because even if the
+                 * QMDL was already compressed, we decompress it before zipping.
+                 * This is for two reasons
+                 * 1. If this is the current entry, it's still being written and
+                 *    lacks a GZIP footer. If we zipped up this partial .gz
+                 *    file, some software might consider it damaged and refuse to
+                 *    extract it.
+                 * 2. Zipping an already-GZIP'd file is redundant and
+                 *    inconvenient for the user.
+                 */
+                let zip_entry = ZipEntryBuilder::new(
+                    file_kind.get_filename(&qmdl_idx, false).into(),
+                    Compression::Stored,
+                );
                 // FuturesAsyncWriteCompatExt::compat_write because async-zip's entrystream does
                 // not impl tokio's AsyncWrite, but only future's AsyncWrite. This can be removed
                 // once https://github.com/Majored/rs-async-zip/pull/160 is released.
-                let mut entry_writer = zip.write_entry_stream(entry).await?.compat_write();
+                let mut entry_writer = zip.write_entry_stream(zip_entry).await?.compat_write();
 
-                let mut qmdl_file = {
-                    let qmdl_store = qmdl_store_lock.read().await;
-                    qmdl_store
-                        .open_entry_qmdl(entry_index)
-                        .await?
-                        .take(qmdl_size_bytes as u64)
-                };
-
-                copy(&mut qmdl_file, &mut entry_writer).await?;
+                if file_kind == FileKind::Qmdl {
+                    let reader = QmdlMessageReader::new(&mut file).await?;
+                    let stream = reader.into_qmdl_stream();
+                    let mut reader = pin!(stream.into_async_read().compat());
+                    copy(&mut reader, &mut entry_writer).await?;
+                } else {
+                    copy(&mut file, &mut entry_writer).await?;
+                }
                 entry_writer.into_inner().close().await?;
             }
 
@@ -387,18 +423,14 @@ pub async fn get_zip(
                 let qmdl_file_for_pcap = {
                     let qmdl_store = qmdl_store_lock.read().await;
                     qmdl_store
-                        .open_entry_qmdl(entry_index)
+                        .open_file(entry_index, FileKind::Qmdl)
                         .await?
-                        .take(qmdl_size_bytes as u64)
+                        .ok_or_else(|| anyhow::anyhow!("QMDL file not found"))?
                 };
+                let qmdl_reader = QmdlMessageReader::new(qmdl_file_for_pcap).await?;
 
-                if let Err(e) = generate_pcap_data(
-                    &mut entry_writer,
-                    qmdl_file_for_pcap,
-                    qmdl_size_bytes,
-                    gps_records,
-                )
-                .await
+                if let Err(e) =
+                    generate_pcap_data(&mut entry_writer, qmdl_reader, gps_records).await
                 {
                     // if we fail to generate the PCAP file, we should still continue and give the
                     // user the QMDL.
@@ -512,10 +544,17 @@ pub async fn debug_set_display_state(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
     use crate::config::GpsMode;
     use async_zip::base::read::mem::ZipFileReader;
     use axum::extract::{Path, State};
+    use futures::AsyncReadExt;
+    use rayhunter::{
+        diag::{DataType, HdlcEncapsulatedMessage, Message, MessagesContainer},
+        qmdl::{QmdlMessageReader, QmdlWriter},
+    };
     use tempfile::TempDir;
 
     async fn create_test_qmdl_store() -> (TempDir, Arc<RwLock<crate::qmdl_store::RecordingStore>>) {
@@ -529,24 +568,25 @@ mod tests {
 
     async fn create_test_entry_with_data(
         store_lock: &Arc<RwLock<crate::qmdl_store::RecordingStore>>,
-        test_data: &[u8],
+        test_data: &MessagesContainer,
     ) -> String {
         let entry_name = {
             let mut store = store_lock.write().await;
-            let (mut qmdl_file, _analysis_file) = store.new_entry(GpsMode::Disabled).await.unwrap();
+            let (mut qmdl_gz_file, _analysis_file) =
+                store.new_entry(GpsMode::Disabled).await.unwrap();
 
-            if !test_data.is_empty() {
-                use tokio::io::AsyncWriteExt;
-                qmdl_file.write_all(test_data).await.unwrap();
-                qmdl_file.flush().await.unwrap();
-            }
+            let mut writer = QmdlWriter::new(&mut qmdl_gz_file);
+            writer.write_container(test_data).await.unwrap();
+            writer.close().await.unwrap();
+
+            let qmdl_file_size = qmdl_gz_file.metadata().await.unwrap().len() as usize;
 
             let current_entry = store.current_entry.unwrap();
             let entry = &store.manifest.entries[current_entry];
             let entry_name = entry.name.clone();
 
             store
-                .update_entry_qmdl_size(current_entry, test_data.len())
+                .update_current_entry_qmdl_size(qmdl_file_size)
                 .await
                 .unwrap();
             entry_name
@@ -580,20 +620,36 @@ mod tests {
             wifi_status: Arc::new(RwLock::new(wifi_station::WifiStatus::default())),
             wifi_scan_lock: tokio::sync::Mutex::new(()),
             gps_state: Arc::new(RwLock::new(None)),
+            update_status_lock: Arc::new(RwLock::new(UpdateStatus::default())),
         })
+    }
+
+    // valid HDLC encapsulated diag message generated from
+    // rayhunter::diag::test::get_test_message
+    fn create_test_container() -> MessagesContainer {
+        MessagesContainer {
+            data_type: DataType::UserSpace,
+            num_messages: 1,
+            messages: vec![HdlcEncapsulatedMessage {
+                len: 39,
+                data: vec![
+                    16, 0, 32, 0, 32, 0, 192, 176, 26, 165, 245, 135, 118, 35, 2, 1, 20, 14, 48, 0,
+                    160, 0, 2, 8, 0, 0, 217, 15, 5, 0, 0, 0, 0, 1, 0, 10, 13, 196, 126,
+                ],
+            }],
+        }
     }
 
     #[tokio::test]
     async fn test_get_zip_success() {
         let (_temp_dir, store_lock) = create_test_qmdl_store().await;
-        let test_qmdl_data = vec![0x7E, 0x00, 0x00, 0x00, 0x10, 0x00, 0x7E];
+        let test_qmdl_data = create_test_container();
         let entry_name = create_test_entry_with_data(&store_lock, &test_qmdl_data).await;
         let state = create_test_server_state(store_lock);
 
-        let result = get_zip(State(state), Path(entry_name.clone())).await;
-
-        assert!(result.is_ok());
-        let response = result.unwrap();
+        let response = get_zip(State(state), Path(entry_name.clone()))
+            .await
+            .unwrap();
 
         let headers = response.headers();
         assert_eq!(headers.get("content-type").unwrap(), "application/zip");
@@ -602,17 +658,36 @@ mod tests {
         let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
 
         let zip_reader = ZipFileReader::new(body_bytes.to_vec()).await.unwrap();
-
-        let filenames = zip_reader
-            .file()
+        let zip_reader_file = zip_reader.file();
+        let filenames: Vec<String> = zip_reader_file
             .entries()
             .iter()
-            .map(|entry| entry.filename().as_str().unwrap().to_owned())
-            .collect::<Vec<String>>();
-
+            .map(|entry| entry.filename().as_str().unwrap().to_string())
+            .collect();
         assert_eq!(
             filenames,
-            vec![format!("{entry_name}.qmdl"), format!("{entry_name}.pcapng"),]
+            vec![
+                format!("{entry_name}.qmdl"),
+                format!("{entry_name}-gps.ndjson"),
+                format!("{entry_name}.pcapng"),
+            ]
+        );
+
+        let mut qmdl_body = Vec::with_capacity(128);
+        zip_reader
+            .reader_without_entry(0)
+            .await
+            .unwrap()
+            .read_to_end(&mut qmdl_body)
+            .await
+            .unwrap();
+        let mut qmdl_reader = QmdlMessageReader::new(Cursor::new(qmdl_body))
+            .await
+            .unwrap();
+        let expected_message = Message::from_hdlc(&test_qmdl_data.messages[0].data).unwrap();
+        assert_eq!(
+            qmdl_reader.get_next_message().await.unwrap(),
+            Some(Ok(expected_message)),
         );
     }
 }
