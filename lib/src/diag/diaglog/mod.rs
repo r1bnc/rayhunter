@@ -3,6 +3,9 @@
 use chrono::{DateTime, FixedOffset};
 use deku::prelude::*;
 
+pub mod ll1;
+pub mod mac;
+pub mod ml1;
 pub mod rrc;
 
 #[derive(Debug, Clone, PartialEq, DekuRead, DekuWrite)]
@@ -75,6 +78,22 @@ pub enum LogBody {
         #[deku(count = "hdr_len")]
         msg: Vec<u8>,
     },
+    #[deku(id = "0xb17f")]
+    LteMl1ServingCellMeasurementAndEvaluation {
+        data: ml1::serving_cell::MeasurementAndEvaluation,
+    },
+    #[deku(id = "0xb180")]
+    LteMl1NeighborCellsMeasurements {
+        data: ml1::neighbor_cells::Measurements,
+    },
+    #[deku(id = "0xb062")]
+    LteMacRachResponse { packet: mac::Packet },
+    #[deku(id = "0xb063")]
+    LteMacDl { packet: mac::Packet },
+    #[deku(id = "0xb064")]
+    LteMacUl { packet: mac::Packet },
+    #[deku(id = "0xb114")]
+    LteLl1ServingCellTiming { data: ll1::ServingCellTiming },
 }
 
 #[derive(Debug, Clone, PartialEq, DekuRead, DekuWrite)]
@@ -113,7 +132,7 @@ impl Timestamp {
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use crate::{diag::*, hdlc};
+    use crate::{diag::*, hdlc, log_codes};
 
     #[test]
     fn test_logs() {
@@ -196,7 +215,6 @@ pub(crate) mod test {
     }
 
     // Just about all of these test cases from manually parsing diag packets w/ QCSuper
-
     #[test]
     fn test_request_serialization() {
         let req = Request::LogConfig(LogConfigRequest::RetrieveIdRanges);
@@ -220,7 +238,17 @@ pub(crate) mod test {
         let req = build_log_mask_request(
             log_type,
             bitsize,
-            &crate::diag_device::LOG_CODES_FOR_RAW_PACKET_LOGGING,
+            &[
+                log_codes::LOG_GSM_RR_SIGNALING_MESSAGE_C,
+                log_codes::WCDMA_SIGNALLING_MESSAGE,
+                log_codes::LOG_LTE_RRC_OTA_MSG_LOG_C,
+                log_codes::LOG_NR_RRC_OTA_MSG_LOG_C,
+                log_codes::LOG_UMTS_NAS_OTA_MESSAGE_LOG_PACKET_C,
+                log_codes::LOG_LTE_NAS_ESM_OTA_IN_MSG_LOG_C,
+                log_codes::LOG_LTE_NAS_ESM_OTA_OUT_MSG_LOG_C,
+                log_codes::LOG_LTE_NAS_EMM_OTA_IN_MSG_LOG_C,
+                log_codes::LOG_LTE_NAS_EMM_OTA_OUT_MSG_LOG_C,
+            ],
         );
         assert_eq!(
             req,
@@ -228,11 +256,9 @@ pub(crate) mod test {
                 log_type,
                 log_mask_bitsize: bitsize,
                 log_mask: vec![
-                    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-                    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0xc, 0x30, 0x0,
-                    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-                    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-                    0x0, 0x0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0,
+                    0, 0, 12, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
                 ],
             })
         );

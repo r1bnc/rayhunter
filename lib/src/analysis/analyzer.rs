@@ -5,10 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
 use crate::analysis::diagnostic::DiagnosticAnalyzer;
-use crate::diag::{DiagParsingError, Message};
-use crate::gsmtap::{GsmtapHeader, GsmtapMessage, GsmtapType};
+use crate::diag::{DiagParsingError, Message, MessagesContainer};
+use crate::gsmtap::{GsmtapHeader, GsmtapMessage, GsmtapType, parser as gsmtap_parser};
 use crate::util::RuntimeMetadata;
-use crate::{diag::MessagesContainer, gsmtap::parser as gsmtap_parser};
 
 use super::{
     connection_redirect_downgrade::ConnectionRedirect2GDowngradeAnalyzer,
@@ -107,7 +106,7 @@ impl<'de> Deserialize<'de> for EventType {
 /// Events are user-facing signals that can be emitted by an [Analyzer] upon a
 /// message being received. They can be used to signifiy an IC detection
 /// warning, or just to display some relevant information to the user.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Event {
     pub event_type: EventType,
     pub message: String,
@@ -145,7 +144,7 @@ pub trait Analyzer {
 }
 
 /// Specific information on a given analyzer
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[cfg_attr(feature = "apidocs", derive(utoipa::ToSchema))]
 pub struct AnalyzerMetadata {
     /// The analyzer name
@@ -157,7 +156,7 @@ pub struct AnalyzerMetadata {
 }
 
 /// The metadata for an analyzed report
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(default)]
 #[derive(Default)]
 #[cfg_attr(feature = "apidocs", derive(utoipa::ToSchema))]
@@ -431,16 +430,13 @@ impl Harness {
                 return row;
             }
         };
-        let gsmtap_message = match gsmtap_parser::parse(qmdl_message) {
-            Ok(msg) => msg,
+        let (timestamp, gsmtap_msg) = match gsmtap_parser::parse(qmdl_message) {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return row,
             Err(err) => {
                 row.skipped_message_reason = Some(format!("{err:?}"));
                 return row;
             }
-        };
-
-        let Some((timestamp, gsmtap_msg)) = gsmtap_message else {
-            return row;
         };
         row.packet_timestamp = Some(timestamp.to_datetime());
 
