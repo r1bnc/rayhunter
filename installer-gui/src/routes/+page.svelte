@@ -1,31 +1,40 @@
 <script lang="ts">
-    import { invoke } from '@tauri-apps/api/core';
-    import { listen } from '@tauri-apps/api/event';
+    import ArgMenu from '$lib/ArgMenu.svelte';
+    import DeviceSelect from '$lib/DeviceSelect.svelte';
+    import InstallProgress from '$lib/InstallProgress.svelte';
+    import { ArgMenuInputData } from '$lib/types.svelte';
+    import type { InstallerSubcommand } from '$lib/types.svelte';
+    import type { PageProps } from './$types';
 
-    let buttonEnabled = $state(true);
-    let installerArgs = $state('');
-    let installerOutput = $state('');
+    type GUIScreen = 'DeviceSelection' | 'ArgSelection' | 'Installation';
 
-    listen<string>('installer-output', (event) => {
-        installerOutput += event.payload;
-    });
+    let { data }: PageProps = $props();
+    let argMenuData = $state(new ArgMenuInputData());
+    let currentScreen: GUIScreen = $state('DeviceSelection');
+    let installerArgs: string[] = $state([]);
+    let selectedDevice: InstallerSubcommand | null = $state(null);
 
-    async function run_installer(event: Event) {
-        event.preventDefault();
-        buttonEnabled = false;
-        installerOutput = '';
-        try {
-            await invoke('install_rayhunter', { args: installerArgs });
-        } catch (error) {
-            installerOutput +=
-                'Rayhunter GUI installer encountered an internal error. Error was:\n';
-            installerOutput += error;
+    function reselect_device() {
+        currentScreen = 'DeviceSelection';
+    }
+
+    function set_device(device: InstallerSubcommand) {
+        if (device != selectedDevice) {
+            argMenuData = new ArgMenuInputData();
         }
-        buttonEnabled = true;
+        selectedDevice = device;
+        currentScreen = 'ArgSelection';
+    }
+
+    function set_args(args: string[]) {
+        installerArgs = args;
+        currentScreen = 'Installation';
     }
 </script>
 
-<div class="p-4 xl:px-8 bg-rayhunter-blue drop-shadow flex flex-row justify-between items-center">
+<div
+    class="mb-4 p-4 xl:px-8 bg-rayhunter-blue drop-shadow flex flex-row justify-between items-center"
+>
     <!-- https://www.w3.org/WAI/tutorials/images/decorative/ -->
     <img src="/rayhunter_text.png" alt="" class="h-10 xl:h-12" />
     <div class="flex flex-row gap-4">
@@ -75,24 +84,42 @@
                 />
             </svg>
         </a>
+        <a
+            class="flex flex-row gap-1 group"
+            href="https://eff.org/donate-rayhunter"
+            target="_blank"
+        >
+            <span class="hidden text-white group-hover:text-gray-400 lg:flex">Donate</span>
+            <svg
+                class="w-6 h-6 text-white group-hover:text-gray-400"
+                aria-hidden="true"
+                xmlns="http://www.w3.org/2000/svg"
+                width="24"
+                height="24"
+                fill="currentColor"
+                viewBox="0 0 24 24"
+            >
+                <path
+                    d="m12.75 20.66 6.184-7.098c2.677-2.884 2.559-6.506.754-8.705-.898-1.095-2.206-1.816-3.72-1.855-1.293-.034-2.652.43-3.963 1.537-1.31-1.108-2.67-1.571-3.962-1.537-1.515.04-2.823.76-3.72 1.855-1.806 2.2-1.924 5.821.753 8.705l6.184 7.098.245.281a.75.75 0 0 0 1.09 0l.246-.281Z"
+                />
+            </svg>
+        </a>
     </div>
 </div>
-<form class="flex justify-center pt-5" onsubmit={run_installer}>
-    <input
-        class="mr-1 px-5 py-2 rounded-lg shadow-md"
-        placeholder="Enter CLI installer args..."
-        autocapitalize="off"
-        autocorrect="off"
-        spellcheck="false"
-        bind:value={installerArgs}
+{#if currentScreen === 'DeviceSelection' || selectedDevice === null}
+    <DeviceSelect initialSelection={selectedDevice} {set_device} subcommands={data.subcommands} />
+{:else if currentScreen === 'ArgSelection'}
+    <ArgMenu
+        bind:inputData={argMenuData}
+        {reselect_device}
+        {set_args}
+        subcommand={selectedDevice}
     />
-    <button
-        class="{buttonEnabled ? 'cursor-pointer' : ''} px-5 py-2 rounded-lg shadow-md"
-        disabled={!buttonEnabled}
-        type="submit">Run</button
-    >
-</form>
-<p class="p-4">Installer output:</p>
-<p class="bg-gray-100 px-5 py-2 rounded-lg shadow-md whitespace-pre-line">
-    {installerOutput}
-</p>
+{:else}
+    <InstallProgress
+        deviceName={selectedDevice.label}
+        {installerArgs}
+        reselect_args={() => (currentScreen = 'ArgSelection')}
+        {reselect_device}
+    />
+{/if}

@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+
 use anyhow::{Context, Error};
 use clap::{Parser, Subcommand};
 use env_logger::Env;
@@ -90,7 +92,7 @@ struct InstallTpLink {
     ///
     /// Only override this when the installer does not work on your hardware version, as otherwise
     /// your custom path may conflict with the builtin storage functionality.
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", hide_default_value = true)]
     sdcard_path: String,
 
     /// Overwrite config.toml even if it already exists on the device.
@@ -290,8 +292,6 @@ struct Serial {
 }
 
 async fn run(args: Args) -> Result<(), Error> {
-    env_logger::Builder::from_env(Env::default().default_filter_or("off")).init();
-
     match args.command {
         Command::Tmobile(args) => tmobile::install(args).await.context("Failed to install rayhunter on the Tmobile TMOHS1. Make sure your computer is connected to the hotspot using USB tethering or WiFi.")?,
         #[cfg(not(target_os = "android"))]
@@ -377,10 +377,11 @@ pub type OutputCallback = Box<dyn Fn(&str) + Send + Sync>;
 ///     }))
 /// );
 /// ```
-pub fn run_with_callback<'a>(
-    args: impl IntoIterator<Item = &'a str>,
-    callback: Option<OutputCallback>,
-) -> Result<(), Error> {
+pub fn run_with_callback<I, T>(args: I, callback: Option<OutputCallback>) -> Result<(), Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
     let _guard;
     if let Some(cb) = callback {
         _guard = output::set_output_callback(move |s: &str| cb(s));
@@ -391,7 +392,8 @@ pub fn run_with_callback<'a>(
         .build()
         .context("Failed to create Tokio runtime")?
         .block_on(async {
-            let args = std::iter::once("installer").chain(args);
+            let args = std::iter::once(OsString::from("installer"))
+                .chain(args.into_iter().map(Into::into));
             match Args::try_parse_from(args) {
                 Ok(parsed_args) => run(parsed_args).await,
                 Err(e) => {
@@ -412,6 +414,8 @@ pub fn version() -> &'static str {
 /// This function is public so the binary can call it, library users should use `run_with_callback`
 /// instead.
 pub async fn main_cli() -> Result<(), Error> {
+    env_logger::Builder::from_env(Env::default().default_filter_or("off")).init();
+
     let args = Args::parse();
     run(args).await
 }

@@ -1,20 +1,23 @@
 use std::borrow::Cow;
+use std::collections::BTreeSet;
+
+use chrono::{DateTime, FixedOffset};
 
 use pycrate_rs::nas::NASMessage;
 use pycrate_rs::nas::emm::EMMMessage;
 
 use super::analyzer::{Analyzer, Event, EventType};
 use super::information_element::{InformationElement, LteInformationElement};
+use crate::plmn::{PACKED_BCD_LEN, decode_packed_bcd};
 use log::{debug, error};
 
 use pycrate_rs::nas::generated::emm::emm_attach_reject::EMMCauseEMMCause as AttachRejectEMMCause;
 use pycrate_rs::nas::generated::emm::emm_attach_request::TAI;
 use telcom_parser::lte_rrc::{BCCH_DL_SCH_MessageType, BCCH_DL_SCH_MessageType_c1};
-use telcom_parser::lte_rrc::{MCC_MNC_Digit, PLMN_Identity, PLMN_IdentityList};
 use telcom_parser::lte_rrc::{
-    /* DL_DCCH_MessageType, DL_DCCH_MessageType_c1,*/ UL_CCCH_MessageType,
-    UL_CCCH_MessageType_c1,
+    DL_DCCH_MessageType, DL_DCCH_MessageType_c1, UL_CCCH_MessageType, UL_CCCH_MessageType_c1,
 };
+use telcom_parser::lte_rrc::{MCC_MNC_Digit, PLMN_Identity, PLMN_IdentityList};
 
 const TIMEOUT_THRESHHOLD: usize = 50;
 
@@ -34,23 +37,40 @@ pub struct ImsiRequestedAnalyzer {
     flag: Option<Event>,
     likely_enb_plmns: Vec<String>,
     likely_ue_plmn: Option<String>,
+    /// From the SIM (EF_HPLMNwAcT). Empty means unknown, not a mismatch.
+    home_plmn: BTreeSet<String>,
 }
 
 impl Default for ImsiRequestedAnalyzer {
     fn default() -> Self {
-        Self::new()
+        Self::new(BTreeSet::new())
     }
 }
 
 impl ImsiRequestedAnalyzer {
-    pub fn new() -> Self {
+    pub fn new(home_plmn: BTreeSet<String>) -> Self {
         Self {
             state: State::Unattached,
             timeout_counter: 0,
             flag: None,
             likely_enb_plmns: vec![],
             likely_ue_plmn: None,
+            home_plmn,
         }
+    }
+
+    /// Whether the tower broadcasts a PLMN this subscriber has a legitimate
+    /// relationship with.
+    fn enb_is_home_network(&self) -> bool {
+        // home_plmn and likely_ue_plmn can disagree, so we check both. Incorrectly returning true
+        // is safer than Incorrectly returning false, as severity is higher on the home network.
+        self.likely_ue_plmn
+            .as_ref()
+            .is_some_and(|p| self.likely_enb_plmns.contains(p))
+            || self
+                .home_plmn
+                .iter()
+                .any(|p| self.likely_enb_plmns.contains(p))
     }
 
     fn transition(&mut self, next_state: State, packet_num: usize) {
@@ -90,11 +110,7 @@ impl ImsiRequestedAnalyzer {
 
             // IMSI to Disconnect without AuthAccept
             (State::IdentityRequest, State::Disconnect) => {
-                if self
-                    .likely_ue_plmn
-                    .as_ref()
-                    .is_some_and(|p| self.likely_enb_plmns.contains(p))
-                {
+                if self.enb_is_home_network() {
                     self.flag = Some(Event {
                         event_type: EventType::High,
                         message: "Disconnected after Identity Request without Auth Accept on home network!".to_string(),
@@ -106,12 +122,21 @@ impl ImsiRequestedAnalyzer {
                         &self.likely_enb_plmns.join(", ")
                     };
                     let ue_plmn_string = self.likely_ue_plmn.as_deref().unwrap_or("Unknown");
+                    let home_plmn_string = if self.home_plmn.is_empty() {
+                        "Unknown".to_string()
+                    } else {
+                        self.home_plmn
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
 
                     self.flag = Some(Event {
                         event_type: EventType::Low,
                         message: format!(
-                            "Disconnected after Identity Request without Auth Accept, but this could be a false positive roaming issue - Tower PLMN: {}, UE PLMN: {}",
-                            enb_plmn_string, ue_plmn_string,
+                            "Disconnected after Identity Request without Auth Accept, but this could be a false positive roaming issue - Tower PLMN: {}, UE PLMN: {}, SIM home PLMN: {}",
+                            enb_plmn_string, ue_plmn_string, home_plmn_string,
                         ),
                     });
                 }
@@ -174,32 +199,11 @@ impl ImsiRequestedAnalyzer {
 
     fn tai_to_plmn_str(&self, maybe_tai: Option<&TAI>) -> Option<String> {
         let plmn = &maybe_tai?.plmn;
-        if plmn.len() != 3 {
+        if plmn.len() != PACKED_BCD_LEN {
             error!("TAI.plmn vector has unexpected length of {}", plmn.len());
             return None;
         }
-
-        let mcc_digit1 = plmn[0] & 0x0F;
-        let mcc_digit2 = (plmn[0] >> 4) & 0x0F;
-        let mcc_digit3 = plmn[1] & 0x0F;
-
-        let mnc_digit1 = plmn[2] & 0x0F;
-        let mnc_digit2 = (plmn[2] >> 4) & 0x0F;
-        let mnc_digit3 = (plmn[1] >> 4) & 0x0F;
-
-        let mcc = mcc_digit1 as u32 * 100 + mcc_digit2 as u32 * 10 + mcc_digit3 as u32;
-
-        let mcc_str = format!("{:03}", mcc);
-        let mnc_str = if mnc_digit3 == 0xF {
-            format!("{:02}", mnc_digit1 * 10 + mnc_digit2)
-        } else {
-            format!(
-                "{:03}",
-                mnc_digit1 as u32 * 100 + mnc_digit2 as u32 * 10 + mnc_digit3 as u32
-            )
-        };
-
-        Some(format!("{}-{}", mcc_str, mnc_str))
+        decode_packed_bcd(plmn)
     }
 }
 
@@ -215,13 +219,14 @@ impl Analyzer for ImsiRequestedAnalyzer {
     }
 
     fn get_version(&self) -> u32 {
-        4
+        5
     }
 
     fn analyze_information_element(
         &mut self,
         ie: &InformationElement,
         packet_num: usize,
+        _timestamp: DateTime<FixedOffset>,
     ) -> Option<Event> {
         // Set the enodeb plmn to the last sib1 we got, we should improve this once we have PCI data, this
         // is a naive approach.
@@ -284,9 +289,6 @@ impl Analyzer for ImsiRequestedAnalyzer {
                     _ => {}
                 },
 
-                // This causes two messages in the event of a false positive when we should always get an attach reject anyway so
-                // I'm commentingit out until I figure out a smarter way to deal with it.
-                /*
                 LteInformationElement::DlDcch(rrc_payload) => {
                     if let DL_DCCH_MessageType::C1(DL_DCCH_MessageType_c1::RrcConnectionRelease(
                         _,
@@ -295,7 +297,6 @@ impl Analyzer for ImsiRequestedAnalyzer {
                         self.transition(State::Disconnect, packet_num)
                     }
                 }
-                */
                 _ => {}
             }
         };

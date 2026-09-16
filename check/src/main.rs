@@ -3,6 +3,7 @@ use clap::Parser;
 use log::{debug, error, info, warn};
 use pcap_file_tokio::pcapng::{Block, PcapNgReader};
 use rayhunter::{
+    DeviceMetadata,
     analysis::analyzer::{AnalysisRow, AnalyzerConfig, Event, EventType, Harness},
     gsmtap::parser as gsmtap_parser,
     pcap::GsmtapPcapWriter,
@@ -23,7 +24,7 @@ struct Args {
     #[arg(short = 'p', long, help = "A file or directory of packet captures")]
     path: PathBuf,
 
-    #[arg(short = 'P', long, help = "Convert qmdl files to pcap before analysis")]
+    #[arg(short = 'P', long, help = "Convert qmdl files to pcap after analysis")]
     pcapify: bool,
 
     #[arg(long, help = "Show why some packets were skipped during analysis")]
@@ -68,7 +69,6 @@ impl Report {
         if let Some(reason) = row.skipped_message_reason {
             *self.skipped_reasons.entry(reason).or_insert(0) += 1;
             self.skipped += 1;
-            return;
         }
         for maybe_event in row.events {
             let Some(event) = maybe_event else { continue };
@@ -105,12 +105,39 @@ impl Report {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::DateTime;
+
+    #[test]
+    fn process_row_records_skip_reason_and_event() {
+        let mut report = Report::new("test");
+        report.process_row(AnalysisRow {
+            packet_timestamp: Some(
+                DateTime::parse_from_rfc3339("2025-01-01T00:00:00+00:00").unwrap(),
+            ),
+            skipped_message_reason: Some("parse error".to_string()),
+            events: vec![Some(Event {
+                event_type: EventType::Low,
+                message: "warning".to_string(),
+            })],
+        });
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.skipped_reasons["parse error"], 1);
+        assert_eq!(report.warnings, 1);
+        assert_eq!(report.events.len(), 1);
+    }
+}
+
 async fn analyze_pcap(
     pcap_path: &str,
     show_skipped: bool,
     json_writer: Option<&mut IncrementalJsonWriter<File>>,
 ) {
-    let mut harness = Harness::new_with_config(&AnalyzerConfig::default());
+    let mut harness =
+        Harness::new_with_config(&AnalyzerConfig::default(), &DeviceMetadata::default());
     let pcap_file = &mut File::open(&pcap_path).await.expect("failed to open file");
     let mut pcap_reader = PcapNgReader::new(pcap_file)
         .await
@@ -140,7 +167,8 @@ async fn analyze_qmdl(
     show_skipped: bool,
     json_writer: Option<&mut IncrementalJsonWriter<File>>,
 ) {
-    let mut harness = Harness::new_with_config(&AnalyzerConfig::default());
+    let mut harness =
+        Harness::new_with_config(&AnalyzerConfig::default(), &DeviceMetadata::default());
     let qmdl_file = &mut File::open(&qmdl_path).await.expect("failed to open file");
     let mut qmdl_reader = QmdlMessageReader::new(qmdl_file)
         .await
@@ -205,7 +233,7 @@ async fn main() {
     };
     rayhunter::init_logging(level);
 
-    let harness = Harness::new_with_config(&AnalyzerConfig::default());
+    let harness = Harness::new_with_config(&AnalyzerConfig::default(), &DeviceMetadata::default());
     let metadata = harness.get_metadata();
     info!("Analyzers:");
     for analyzer in &metadata.analyzers {
